@@ -1,0 +1,798 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR Weather Widget</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <style>
+    body { margin: 0; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', system-ui, sans-serif; background: #f0f2f5; }
+    #overlay { position: absolute; top: 0; left: 0; width: 100%; height: 100%; display: flex; justify-content: center; align-items: center; }
+    #start-button { padding: 15px 28px; font-size: 18px; background: rgba(20, 20, 20, 0.8); color: white; border: none; border-radius: 20px; backdrop-filter: blur(10px); box-shadow: 0 4px 14px rgba(0,0,0,0.2); cursor: pointer; transition: all 0.2s; font-weight: 500; }
+    #start-button:hover { transform: translateY(-2px); background: rgba(30, 30, 30, 0.9); }
+    #status { position: fixed; bottom: 40px; left: 50%; transform: translateX(-50%); background: rgba(255,255,255,0.7); color: black; padding: 12px 24px; border-radius: 18px; font-size: 16px; font-weight: 500; display: none; z-index: 1000; backdrop-filter: blur(5px); }
+    .exit-ar { position: fixed; top: 20px; right: 20px; background: rgba(255,255,255,0.3); color: black; border: none; border-radius: 50%; width: 46px; height: 46px; display: none; align-items: center; justify-content: center; font-size: 24px; cursor: pointer; z-index: 1000; backdrop-filter: blur(5px); }
+    .xr-active .exit-ar { display: flex; }
+    video { display: none; }
+  </style>
+</head>
+<body>
+  <div id="overlay"><button id="start-button">Start Weather Widget</button></div>
+  <button class="exit-ar" id="exit-ar">×</button>
+  <div id="status"></div>
+  
+  <!-- Sky videos for different weather conditions and times -->
+  <video id="sky-sunny" loop muted playsinline crossorigin="anonymous"></video>
+  <video id="sky-cloudy" loop muted playsinline crossorigin="anonymous"></video>
+  <video id="sky-rainy" loop muted playsinline crossorigin="anonymous"></video>
+  <video id="sky-night" loop muted playsinline crossorigin="anonymous"></video>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+
+    // Main variables
+    let camera, scene, renderer, controllers = [], xrSession = null, raycaster, tempMatrix;
+    let weatherWidget, clock, currentWeather, weatherData;
+    
+    // Mock weather data for demo
+    const mockWeatherData = {
+      current: {
+        time: new Date(),
+        temp: 22,
+        condition: 'Sunny',
+        humidity: 65,
+        windSpeed: 10,
+        windDirection: 'NE'
+      },
+      hourly: Array(24).fill().map((_, i) => {
+        const hour = new Date();
+        hour.setHours(hour.getHours() + i);
+        return {
+          time: hour,
+          temp: 20 + Math.sin(i/3) * 5,
+          condition: i > 18 || i < 6 ? 'Clear Night' : 
+                     i > 12 ? 'Partly Cloudy' : 
+                     'Sunny'
+        };
+      })
+    };
+    
+    function init() {
+      // Scene setup
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+      clock = new THREE.Clock();
+      
+      // Renderer setup
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      document.body.appendChild(renderer.domElement);
+
+      // Lighting
+      scene.add(new THREE.AmbientLight(0xffffff, 1.5));
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 1.0);
+      directionalLight.position.set(1, 1, 1).normalize();
+      scene.add(directionalLight);
+      
+      // Interaction setup
+      raycaster = new THREE.Raycaster();
+      tempMatrix = new THREE.Matrix4();
+      
+      // Initialize weather data
+      weatherData = mockWeatherData;
+      currentWeather = weatherData.current;
+      
+      // Set up weather widget
+      weatherWidget = new WeatherWidget();
+      
+      // Event listeners
+      window.addEventListener('resize', () => {
+        if (camera) {
+          camera.aspect = window.innerWidth / window.innerHeight;
+          camera.updateProjectionMatrix();
+        }
+        if (renderer) renderer.setSize(window.innerWidth, window.innerHeight);
+      });
+      
+      document.getElementById('start-button').addEventListener('click', startARSession);
+      document.getElementById('exit-ar').addEventListener('click', () => { if (xrSession) xrSession.end(); });
+    }
+
+    // Start AR session
+    function startARSession() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported in this browser.');
+        return;
+      }
+      
+      navigator.xr.isSessionSupported('immersive-ar')
+        .then(supported => {
+          if (supported) {
+            navigator.xr.requestSession('immersive-ar', { 
+              requiredFeatures: ['hit-test'],
+              optionalFeatures: ['dom-overlay', 'hand-tracking'], 
+              domOverlay: { root: document.body } 
+            })
+            .then(onSessionStarted)
+            .catch(err => updateStatus('Failed to start AR: ' + err.message));
+          } else {
+            updateStatus('WebXR AR not supported on this device.');
+          }
+        });
+    }
+
+    // Handle AR session start
+    function onSessionStarted(session) {
+      xrSession = session;
+      document.getElementById('start-button').style.display = 'none';
+      document.body.classList.add('xr-active');
+      renderer.xr.setReferenceSpaceType('local');
+      renderer.xr.setSession(session);
+      
+      // Setup controllers
+      controllers = [0, 1].map(i => {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        controller.userData.isSelecting = false;
+        controller.userData.pinchStarted = false;
+        controller.userData.pinchPreviousPosition = new THREE.Vector2();
+        
+        // Add controller visual
+        const handMesh = new THREE.Mesh(
+          new THREE.SphereGeometry(0.01, 12, 12),
+          new THREE.MeshBasicMaterial({
+            color: 0x000000,
+            transparent: true,
+            opacity: 0.6
+          })
+        );
+        controller.add(handMesh);
+        
+        // Add event listeners
+        controller.addEventListener('selectstart', onControllerSelectStart);
+        controller.addEventListener('selectend', onControllerSelectEnd);
+        controller.addEventListener('squeezestart', onControllerPinchStart);
+        controller.addEventListener('squeezeend', onControllerPinchEnd);
+        
+        scene.add(controller);
+        return controller;
+      });
+      
+      // Initialize weather widget and scene
+      weatherWidget.init(scene, camera);
+      
+      renderer.setAnimationLoop(render);
+      session.addEventListener('end', onSessionEnd);
+      updateStatus('Weather widget initialized. Look up to see the sky.');
+    }
+    
+    function onSessionEnd() {
+      document.body.classList.remove('xr-active');
+      document.getElementById('start-button').style.display = 'block';
+      document.getElementById('status').style.display = 'none';
+      controllers = [];
+      renderer.setAnimationLoop(null);
+      xrSession = null;
+      
+      // Clean up scene
+      while(scene.children.length > 0) { 
+        const object = scene.children[0];
+        if (object.geometry) object.geometry.dispose();
+        if (object.material) {
+          if (Array.isArray(object.material)) {
+            object.material.forEach(m => m.dispose());
+          } else {
+            object.material.dispose();
+          }
+        }
+        scene.remove(object); 
+      }
+      
+      // Pause videos
+      document.querySelectorAll('video').forEach(video => video.pause());
+    }
+    
+    function onControllerSelectStart(event) {
+      const controller = event.target;
+      controller.userData.isSelecting = true;
+      
+      // Raycasting for interaction
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+      
+      const interactiveObjects = weatherWidget.getInteractiveObjects();
+      const intersects = raycaster.intersectObjects(interactiveObjects, true);
+      
+      if (intersects.length > 0) {
+        // Find interactive parent
+        let current = intersects[0].object;
+        while (current) {
+          if (current.userData && current.userData.onClick) {
+            current.userData.onClick();
+            break;
+          }
+          current = current.parent;
+        }
+      }
+    }
+    
+    function onControllerSelectEnd(event) {
+      event.target.userData.isSelecting = false;
+    }
+    
+    function onControllerPinchStart(event) {
+      const controller = event.target;
+      controller.userData.pinchStarted = true;
+      
+      // Store the starting position for pinch-drag
+      tempMatrix.identity().extractRotation(controller.matrixWorld);
+      raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+      raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+      
+      const skyObject = weatherWidget.getSkyObject();
+      const intersects = raycaster.intersectObject(skyObject, true);
+      
+      if (intersects.length > 0) {
+        controller.userData.pinchPreviousPosition.set(
+          intersects[0].point.x,
+          intersects[0].point.y
+        );
+        controller.userData.isPinchingObject = true;
+      }
+    }
+    
+    function onControllerPinchEnd(event) {
+      const controller = event.target;
+      controller.userData.pinchStarted = false;
+      controller.userData.isPinchingObject = false;
+    }
+    
+    function render(time, frame) {
+      const delta = clock.getDelta();
+      
+      // Update weather widget
+      if (weatherWidget) weatherWidget.update(camera, delta);
+      
+      // Check controller interaction for pinch-drag time scrubbing
+      controllers.forEach(controller => {
+        if (controller.userData.isPinchingObject) {
+          tempMatrix.identity().extractRotation(controller.matrixWorld);
+          raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+          raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+          
+          const skyObject = weatherWidget.getSkyObject();
+          const intersects = raycaster.intersectObject(skyObject, true);
+          
+          if (intersects.length > 0) {
+            const currentPosition = new THREE.Vector2(
+              intersects[0].point.x,
+              intersects[0].point.y
+            );
+            
+            // Calculate drag amount (horizontal = time scrubbing)
+            const dragDelta = new THREE.Vector2().subVectors(
+              currentPosition,
+              controller.userData.pinchPreviousPosition
+            );
+            
+            // Update time based on drag amount (1 unit = 2 hours)
+            if (Math.abs(dragDelta.x) > 0.01) {
+              weatherWidget.adjustTime(Math.round(dragDelta.x * 2));
+              
+              // Update stored position
+              controller.userData.pinchPreviousPosition.copy(currentPosition);
+            }
+          }
+        }
+        
+        // Regular selection raycasting for hover effects
+        if (controller.userData.isSelecting) {
+          tempMatrix.identity().extractRotation(controller.matrixWorld);
+          raycaster.ray.origin.setFromMatrixPosition(controller.matrixWorld);
+          raycaster.ray.direction.set(0, 0, -1).applyMatrix4(tempMatrix);
+          
+          const interactiveObjects = weatherWidget.getInteractiveObjects();
+          const intersects = raycaster.intersectObjects(interactiveObjects, true);
+          
+          if (intersects.length > 0 && intersects[0].object.material) {
+            // Visual feedback on hover
+            const object = intersects[0].object;
+            if (!object.userData.isHovered) {
+              object.userData.originalScale = object.scale.clone();
+              object.scale.multiplyScalar(1.1);
+              object.userData.isHovered = true;
+            }
+          }
+        }
+      });
+      
+      renderer.render(scene, camera);
+    }
+    
+    function updateStatus(message) {
+      const statusElement = document.getElementById('status');
+      statusElement.textContent = message;
+      statusElement.style.display = 'block';
+      
+      // Auto-hide after 4 seconds for non-error messages
+      if (!message.includes('error') && !message.includes('not supported')) {
+        setTimeout(() => { statusElement.style.display = 'none'; }, 4000);
+      }
+    }
+    
+    // Weather Widget Class
+    class WeatherWidget {
+      constructor() {
+        this.widgetGroup = null;
+        this.skyGroup = null;
+        this.timeControls = null;
+        this.weatherInfo = null;
+        this.skyMesh = null;
+        this.currentTimeIndex = 0;
+        this.videoMaterials = {};
+        this.interactiveObjects = [];
+      }
+      
+      init(scene, camera) {
+        this.scene = scene;
+        this.camera = camera;
+        
+        // Create main widget group
+        this.widgetGroup = new THREE.Group();
+        this.scene.add(this.widgetGroup);
+        
+        // Load sky video assets
+        this.loadSkyVideos();
+        
+        // Create sky view
+        this.createSkyView();
+        
+        // Create time controls
+        this.createTimeControls();
+        
+        // Create weather info display
+        this.createWeatherInfo();
+        
+        // Position the widget
+        this.positionWidget();
+      }
+      
+      loadSkyVideos() {
+        // Create placeholder video textures for different weather conditions
+        const createVideoPlaceholder = (elementId, text, color, secondaryColor) => {
+          const video = document.getElementById(elementId);
+          const canvas = document.createElement('canvas');
+          canvas.width = 512;
+          canvas.height = 512;
+          const ctx = canvas.getContext('2d');
+          
+          // Create gradient background
+          const gradient = ctx.createRadialGradient(
+            canvas.width/2, canvas.height/2, 0,
+            canvas.width/2, canvas.height/2, canvas.width/2
+          );
+          gradient.addColorStop(0, color);
+          gradient.addColorStop(1, secondaryColor);
+          ctx.fillStyle = gradient;
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          
+          // Add some random clouds or stars for visual interest
+          const isNight = text.includes('Night');
+          if (isNight) {
+            // Add stars
+            for (let i = 0; i < 200; i++) {
+              const x = Math.random() * canvas.width;
+              const y = Math.random() * canvas.height;
+              const size = Math.random() * 2 + 1;
+              ctx.fillStyle = `rgba(255, 255, 255, ${Math.random() * 0.7 + 0.3})`;
+              ctx.fillRect(x, y, size, size);
+            }
+          } else if (text.includes('Cloudy') || text.includes('Rainy')) {
+            // Add cloud shapes
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            for (let i = 0; i < 5; i++) {
+              const x = Math.random() * canvas.width;
+              const y = Math.random() * (canvas.height/2);
+              const size = Math.random() * 100 + 50;
+              
+              // Draw cloud shape
+              ctx.beginPath();
+              ctx.arc(x, y, size/2, 0, Math.PI * 2);
+              ctx.arc(x + size/2, y - size/4, size/3, 0, Math.PI * 2);
+              ctx.arc(x - size/2, y - size/4, size/3, 0, Math.PI * 2);
+              ctx.fill();
+            }
+          }
+          
+          // Add text label
+          ctx.font = 'bold 40px sans-serif';
+          ctx.fillStyle = isNight ? '#ffffff' : '#000000';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(text, canvas.width/2, canvas.height/2);
+          
+          // Set video source to canvas data URL
+          video.src = canvas.toDataURL();
+          
+          // Create video texture
+          const texture = new THREE.VideoTexture(video);
+          texture.minFilter = THREE.LinearFilter;
+          texture.magFilter = THREE.LinearFilter;
+          
+          // Store in materials collection
+          this.videoMaterials[elementId] = {
+            video: video,
+            texture: texture,
+            material: new THREE.MeshBasicMaterial({
+              map: texture,
+              transparent: true,
+              side: THREE.DoubleSide
+            })
+          };
+          
+          video.play().catch(() => {/* Will try again when needed */});
+        };
+        
+        // Create video placeholders for different weather conditions
+        createVideoPlaceholder('sky-sunny', 'Sunny Day', '#87CEEB', '#E0F7FF');
+        createVideoPlaceholder('sky-cloudy', 'Partly Cloudy', '#B4C7DC', '#D6E4F0');
+        createVideoPlaceholder('sky-rainy', 'Rainy', '#708090', '#A9A9A9');
+        createVideoPlaceholder('sky-night', 'Clear Night', '#191970', '#000033');
+      }
+      
+      createSkyView() {
+        // Create sky group
+        this.skyGroup = new THREE.Group();
+        
+        // Create circular cutout for sky view - INCREASED SIZE
+        const skyRadius = 0.4; // Changed from 0.3 to 0.4 to make the circle bigger
+        const skyGeometry = new THREE.CircleGeometry(skyRadius, 32);
+        this.skyMesh = new THREE.Mesh(
+          skyGeometry,
+          this.videoMaterials['sky-sunny'].material // Default to sunny
+        );
+        
+        // Make sky interactive for pinch-drag time scrubbing
+        this.skyMesh.userData.isSky = true;
+        
+        this.skyGroup.add(this.skyMesh);
+        
+        // Add a ring around the sky
+        const ringGeometry = new THREE.RingGeometry(skyRadius, skyRadius + 0.02, 32);
+        const ringMaterial = new THREE.MeshBasicMaterial({
+          color: 0xffffff,
+          side: THREE.DoubleSide,
+          transparent: true,
+          opacity: 0.8
+        });
+        const ring = new THREE.Mesh(ringGeometry, ringMaterial);
+        ring.position.z = -0.001; // Behind sky
+        this.skyGroup.add(ring);
+        
+        // Tilt the sky group to align better with actual sky
+        this.skyGroup.rotation.x = -0.3; // Tilt upward
+        
+        this.widgetGroup.add(this.skyGroup);
+      }
+      
+      createTimeControls() {
+        // Create time controls group
+        this.timeControls = new THREE.Group();
+        
+        // Main time display
+        const timeDisplayCanvas = document.createElement('canvas');
+        timeDisplayCanvas.width = 512;
+        timeDisplayCanvas.height = 128;
+        const timeCtx = timeDisplayCanvas.getContext('2d');
+        const timeTexture = new THREE.CanvasTexture(timeDisplayCanvas);
+        
+        const timeDisplay = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.25, 0.06),
+          new THREE.MeshBasicMaterial({
+            map: timeTexture,
+            transparent: true
+          })
+        );
+        timeDisplay.position.set(0, -0.38, 0);
+        
+        // Update time display function
+        timeDisplay.userData.updateTime = (time) => {
+          timeCtx.clearRect(0, 0, 512, 128);
+          
+          // Background
+          timeCtx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+          timeCtx.beginPath();
+          timeCtx.roundRect(0, 0, 512, 128, 20);
+          timeCtx.fill();
+          
+          // Time text
+          timeCtx.font = 'bold 48px sans-serif';
+          timeCtx.fillStyle = '#000000';
+          timeCtx.textAlign = 'center';
+          timeCtx.textBaseline = 'middle';
+          
+          // Format time
+          const hours = time.getHours();
+          const minutes = time.getMinutes();
+          const formattedTime = `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
+          timeCtx.fillText(formattedTime, 256, 64);
+          
+          timeTexture.needsUpdate = true;
+        };
+        
+        this.timeControls.add(timeDisplay);
+        
+        // Time navigation arrows - UPDATED to follow circle's edge
+        const createArrowButton = (label, offsetX, hoursChange) => {
+          const buttonCanvas = document.createElement('canvas');
+          buttonCanvas.width = 128;
+          buttonCanvas.height = 128;
+          const btnCtx = buttonCanvas.getContext('2d');
+          const buttonTexture = new THREE.CanvasTexture(buttonCanvas);
+          
+          // Draw button
+          const updateButton = (highlighted) => {
+            btnCtx.clearRect(0, 0, 128, 128);
+            
+            // Background
+            btnCtx.fillStyle = highlighted ? 'rgba(200, 220, 255, 0.9)' : 'rgba(255, 255, 255, 0.7)';
+            btnCtx.beginPath();
+            btnCtx.arc(64, 64, 40, 0, Math.PI * 2);
+            btnCtx.fill();
+            
+            // Arrow or text
+            btnCtx.fillStyle = '#000000';
+            if (label === '<' || label === '>') {
+              // Draw curved arrows following the circle edge
+              btnCtx.strokeStyle = '#000000';
+              btnCtx.lineWidth = 5;
+              
+              if (label === '<') {
+                // Draw curved left arrow body following circle edge
+                btnCtx.beginPath();
+                btnCtx.arc(64, 104, 40, 1.25 * Math.PI, 1.75 * Math.PI, true);
+                btnCtx.stroke();
+                
+                // Arrow head
+                btnCtx.beginPath();
+                btnCtx.moveTo(40, 70);
+                btnCtx.lineTo(48, 64);
+                btnCtx.lineTo(40, 58);
+                btnCtx.stroke();
+              } else {
+                // Draw curved right arrow body following circle edge
+                btnCtx.beginPath();
+                btnCtx.arc(64, 104, 40, 1.25 * Math.PI, 1.75 * Math.PI);
+                btnCtx.stroke();
+                
+                // Arrow head
+                btnCtx.beginPath();
+                btnCtx.moveTo(88, 70);
+                btnCtx.lineTo(80, 64);
+                btnCtx.lineTo(88, 58);
+                btnCtx.stroke();
+              }
+            } else {
+              // Draw text
+              btnCtx.font = 'bold 24px sans-serif';
+              btnCtx.textAlign = 'center';
+              btnCtx.textBaseline = 'middle';
+              btnCtx.fillText(label, 64, 64);
+            }
+            
+            buttonTexture.needsUpdate = true;
+          };
+          
+          updateButton(false);
+          
+          const button = new THREE.Mesh(
+            new THREE.CircleGeometry(0.04, 32),
+            new THREE.MeshBasicMaterial({
+              map: buttonTexture,
+              transparent: true
+            })
+          );
+          button.position.set(offsetX, -0.38, 0);
+          
+          // Make interactive
+          button.userData.onClick = () => {
+            this.adjustTime(hoursChange);
+            updateButton(true);
+            setTimeout(() => updateButton(false), 200);
+          };
+          
+          this.interactiveObjects.push(button);
+          return button;
+        };
+        
+        // Add time navigation buttons
+        this.timeControls.add(createArrowButton('-1d', -0.2, -24));
+        this.timeControls.add(createArrowButton('-3h', -0.12, -3));
+        this.timeControls.add(createArrowButton('<', -0.05, -1));
+        this.timeControls.add(createArrowButton('>', 0.05, 1));
+        this.timeControls.add(createArrowButton('+3h', 0.12, 3));
+        this.timeControls.add(createArrowButton('+1d', 0.2, 24));
+        
+        this.widgetGroup.add(this.timeControls);
+      }
+      
+      createWeatherInfo() {
+        // Create weather info display
+        this.weatherInfo = new THREE.Group();
+        
+        // Weather info canvas
+        const infoCanvas = document.createElement('canvas');
+        infoCanvas.width = 512;
+        infoCanvas.height = 256;
+        const infoCtx = infoCanvas.getContext('2d');
+        const infoTexture = new THREE.CanvasTexture(infoCanvas);
+        
+        const infoDisplay = new THREE.Mesh(
+          new THREE.PlaneGeometry(0.3, 0.15),
+          new THREE.MeshBasicMaterial({
+            map: infoTexture,
+            transparent: true
+          })
+        );
+        // Position and tilt the info display toward the camera
+        infoDisplay.position.set(0, -0.5, 0.05); // Added z offset to bring it forward
+        infoDisplay.rotation.x = 0.3; // Added rotation to tilt it towards viewer
+        
+        // Update weather info function
+        infoDisplay.userData.updateInfo = (weather) => {
+          infoCtx.clearRect(0, 0, 512, 256);
+          
+          // Background with frosted glass effect
+          infoCtx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+          infoCtx.beginPath();
+          infoCtx.roundRect(0, 0, 512, 256, 20);
+          infoCtx.fill();
+          
+          // Add noise texture for glass effect
+          for (let i = 0; i < 2000; i++) {
+            const x = Math.random() * 512;
+            const y = Math.random() * 256;
+            infoCtx.fillStyle = `rgba(255, 255, 255, ${Math.random() * 0.03})`;
+            infoCtx.fillRect(x, y, 1, 1);
+          }
+          
+          // Temperature in large font
+          infoCtx.font = 'bold 64px sans-serif';
+          infoCtx.fillStyle = '#000000';
+          infoCtx.textAlign = 'center';
+          infoCtx.textBaseline = 'top';
+          infoCtx.fillText(`${Math.round(weather.temp)}°C`, 256, 20);
+          
+          // Weather condition
+          infoCtx.font = '32px sans-serif';
+          infoCtx.fillText(weather.condition, 256, 100);
+          
+          // Wind and humidity
+          infoCtx.font = '24px sans-serif';
+          infoCtx.fillText(`Wind: ${weather.windSpeed} km/h ${weather.windDirection}`, 256, 150);
+          infoCtx.fillText(`Humidity: ${weather.humidity}%`, 256, 190);
+          
+          infoTexture.needsUpdate = true;
+        };
+        
+        this.weatherInfo.add(infoDisplay);
+        this.widgetGroup.add(this.weatherInfo);
+      }
+      
+      positionWidget() {
+        // Position widget higher to look more like a sky cutout
+        this.widgetGroup.position.set(0, 0.5, -0.6); // Changed Y from 0.3 to 0.5
+      }
+      
+      update(camera, delta) {
+        if (!this.widgetGroup || !camera) return;
+        
+        // Position widget relative to camera - MODIFIED to be higher in view
+        const cameraDirection = new THREE.Vector3(0, 0.6, -0.8); // Changed from (0, 0.4, -1) to increase height and reduce distance
+        cameraDirection.applyQuaternion(camera.quaternion);
+        cameraDirection.multiplyScalar(0.8);
+        
+        // Calculate target position
+        const targetPosition = new THREE.Vector3()
+          .copy(camera.position)
+          .add(cameraDirection);
+        
+        // Smooth follow
+        this.widgetGroup.position.lerp(targetPosition, 0.1);
+        this.widgetGroup.lookAt(camera.position);
+        
+        // Update video textures
+        for (const key in this.videoMaterials) {
+          if (this.videoMaterials[key] && this.videoMaterials[key].texture) {
+            this.videoMaterials[key].texture.needsUpdate = true;
+          }
+        }
+        
+        // Update UI with current time and weather
+        this.updateUIDisplay();
+      }
+      
+      updateUIDisplay() {
+        // Find time display and update
+        if (this.timeControls && this.timeControls.children[0]) {
+          const currentTime = this.getCurrentTimeFromIndex();
+          this.timeControls.children[0].userData.updateTime(currentTime);
+        }
+        
+        // Find weather info display and update
+        if (this.weatherInfo && this.weatherInfo.children[0]) {
+          const currentWeather = this.getCurrentWeatherFromTime();
+          this.weatherInfo.children[0].userData.updateInfo(currentWeather);
+        }
+        
+        // Update sky video based on current weather
+        this.updateSkyVideo(this.getCurrentWeatherFromTime());
+      }
+      
+      updateSkyVideo(weather) {
+        if (!this.skyMesh) return;
+        
+        // Determine which video to use based on weather
+        let videoId = 'sky-sunny';
+        
+        const hour = this.getCurrentTimeFromIndex().getHours();
+        const isNight = hour < 6 || hour >= 20;
+        
+        if (isNight) {
+          videoId = 'sky-night';
+        } else if (weather.condition.includes('Rain')) {
+          videoId = 'sky-rainy';
+        } else if (weather.condition.includes('Cloud')) {
+          videoId = 'sky-cloudy';
+        }
+        
+        // Apply video material
+        if (this.videoMaterials[videoId] && this.videoMaterials[videoId].material) {
+          this.skyMesh.material = this.videoMaterials[videoId].material;
+          this.videoMaterials[videoId].video.play().catch(() => {});
+        }
+      }
+      
+      adjustTime(hourDelta) {
+        // Calculate the next time index
+        const newIndex = this.currentTimeIndex + hourDelta;
+        
+        // Ensure index stays within bounds (24 hour forecast)
+        if (newIndex >= 0 && newIndex < weatherData.hourly.length) {
+          this.currentTimeIndex = newIndex;
+        } else if (newIndex < 0) {
+          this.currentTimeIndex = 0;
+        } else {
+          this.currentTimeIndex = weatherData.hourly.length - 1;
+        }
+        
+        // Update UI with new time
+        this.updateUIDisplay();
+      }
+      
+      getCurrentTimeFromIndex() {
+        return weatherData.hourly[this.currentTimeIndex].time;
+      }
+      
+      getCurrentWeatherFromTime() {
+        return weatherData.hourly[this.currentTimeIndex];
+      }
+      
+      getInteractiveObjects() {
+        return this.interactiveObjects;
+      }
+      
+      getSkyObject() {
+        return this.skyMesh;
+      }
+    }
+    
+    // Initialize everything
+    document.addEventListener('DOMContentLoaded', init);
+  </script>
+</body>
+</html>
